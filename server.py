@@ -1018,7 +1018,7 @@ async def add_video_prompt(session_id: str, request: VideoPromptRequest):
             
             for idx, frame in enumerate(session.frames):
                 if frame is not None:
-                    frame_path = os.path.join(session.temp_dir, f"frame_{idx:06d}.jpg")
+                    frame_path = os.path.join(session.temp_dir, f"{idx}.jpg")
                     Image.fromarray(frame).save(frame_path, quality=95)
             
             # Initialize the predictor session with the temp directory
