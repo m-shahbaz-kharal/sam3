@@ -208,10 +208,19 @@ class VideoSession:
     last_accessed: float = field(default_factory=time.time)
     # Maps external frame indices to internal SAM3 frame indices
     frame_idx_mapping: Dict[int, int] = field(default_factory=dict)
+    # Track how many frames were present when SAM3 session was initialized
+    frames_at_init: int = 0
     
     def touch(self) -> None:
         """Update last accessed time."""
         self.last_accessed = time.time()
+    
+    def needs_reinit(self) -> bool:
+        """Check if session needs re-initialization due to new frames."""
+        if self.internal_session_id is None:
+            return False
+        current_frame_count = sum(1 for f in self.frames if f is not None)
+        return current_frame_count != self.frames_at_init
 
 
 class SessionManager:
@@ -998,6 +1007,27 @@ async def add_video_prompt(session_id: str, request: VideoPromptRequest):
     session = _get_video_session(session_id)
     
     try:
+        # Check if we need to re-initialize due to new frames being added
+        if session.needs_reinit():
+            logger.info("Re-initializing video session due to new frames")
+            # Close old internal session
+            if session.internal_session_id:
+                try:
+                    session.predictor.close_session(session.internal_session_id)
+                except Exception as e:
+                    logger.warning(f"Error closing old session: {e}")
+            # Clean up old temp directory
+            if session.temp_dir:
+                try:
+                    shutil.rmtree(session.temp_dir)
+                except Exception as e:
+                    logger.warning(f"Error cleaning up temp dir: {e}")
+            # Reset state
+            session.internal_session_id = None
+            session.temp_dir = None
+            session.frame_idx_mapping.clear()
+            session.outputs.clear()
+        
         # Lazy initialization for streaming mode
         if session.internal_session_id is None:
             if not session.streaming:
@@ -1033,7 +1063,8 @@ async def add_video_prompt(session_id: str, request: VideoPromptRequest):
                 "resource_path": session.temp_dir,
             })
             session.internal_session_id = response.get("session_id")
-            logger.info(f"Created internal video session: {session.internal_session_id}")
+            session.frames_at_init = len(valid_frames)
+            logger.info(f"Created internal video session: {session.internal_session_id} with {session.frames_at_init} frames")
         
         # Map external frame index to internal SAM3 frame index
         internal_frame_idx = session.frame_idx_mapping.get(request.frame_idx)
