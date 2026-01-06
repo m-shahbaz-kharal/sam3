@@ -20,6 +20,9 @@ import asyncio
 import base64
 import io
 import logging
+import os
+import shutil
+import tempfile
 import threading
 import time
 import uuid
@@ -199,6 +202,7 @@ class VideoSession:
     frames: List[np.ndarray] = field(default_factory=list)
     outputs: Dict[int, Dict] = field(default_factory=dict)
     streaming: bool = True
+    temp_dir: Optional[str] = None
     device: str = "cuda"
     created_at: float = field(default_factory=time.time)
     last_accessed: float = field(default_factory=time.time)
@@ -400,6 +404,13 @@ class SessionManager:
                         session.predictor.close_session(session.internal_session_id)
                     except Exception as e:
                         logger.warning(f"Error closing internal video session: {e}")
+                # Clean up temp directory if it exists
+                if session.temp_dir:
+                    try:
+                        shutil.rmtree(session.temp_dir)
+                        logger.info(f"Cleaned up temp directory: {session.temp_dir}")
+                    except Exception as e:
+                        logger.warning(f"Error cleaning up temp directory: {e}")
                 logger.info(f"Closed video session: {session_id}")
                 self._maybe_unload_models()
                 return True
@@ -985,13 +996,38 @@ async def add_video_prompt(session_id: str, request: VideoPromptRequest):
     session = _get_video_session(session_id)
     
     try:
+        # Lazy initialization for streaming mode
         if session.internal_session_id is None:
-            # For streaming, we need to create a session with the frames we have
-            # This is a simplified implementation - real video requires temp files
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Video session not started. Call /video/{session_id}/start first."
-            )
+            if not session.streaming:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Video session not started. Call /video/{session_id}/start first."
+                )
+            
+            # For streaming mode, check if we have frames to process
+            valid_frames = [f for f in session.frames if f is not None]
+            if not valid_frames:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="No frames added. Call /video/{session_id}/frame first."
+                )
+            
+            # Create temp directory and save frames
+            logger.info(f"Initializing streaming session with {len(valid_frames)} frames")
+            session.temp_dir = tempfile.mkdtemp(prefix="sam3_video_")
+            
+            for idx, frame in enumerate(session.frames):
+                if frame is not None:
+                    frame_path = os.path.join(session.temp_dir, f"frame_{idx:06d}.jpg")
+                    Image.fromarray(frame).save(frame_path, quality=95)
+            
+            # Initialize the predictor session with the temp directory
+            response = session.predictor.handle_request({
+                "type": "start_session",
+                "resource_path": session.temp_dir,
+            })
+            session.internal_session_id = response.get("session_id")
+            logger.info(f"Created internal video session: {session.internal_session_id}")
         
         prompt_request = {
             "type": "add_prompt",
