@@ -206,6 +206,8 @@ class VideoSession:
     device: str = "cuda"
     created_at: float = field(default_factory=time.time)
     last_accessed: float = field(default_factory=time.time)
+    # Maps external frame indices to internal SAM3 frame indices
+    frame_idx_mapping: Dict[int, int] = field(default_factory=dict)
     
     def touch(self) -> None:
         """Update last accessed time."""
@@ -1016,10 +1018,14 @@ async def add_video_prompt(session_id: str, request: VideoPromptRequest):
             logger.info(f"Initializing streaming session with {len(valid_frames)} frames")
             session.temp_dir = tempfile.mkdtemp(prefix="sam3_video_")
             
-            for idx, frame in enumerate(session.frames):
+            # Save frames with contiguous indices and create mapping
+            internal_idx = 0
+            for external_idx, frame in enumerate(session.frames):
                 if frame is not None:
-                    frame_path = os.path.join(session.temp_dir, f"{idx}.jpg")
+                    frame_path = os.path.join(session.temp_dir, f"{internal_idx}.jpg")
                     Image.fromarray(frame).save(frame_path, quality=95)
+                    session.frame_idx_mapping[external_idx] = internal_idx
+                    internal_idx += 1
             
             # Initialize the predictor session with the temp directory
             response = session.predictor.handle_request({
@@ -1029,10 +1035,18 @@ async def add_video_prompt(session_id: str, request: VideoPromptRequest):
             session.internal_session_id = response.get("session_id")
             logger.info(f"Created internal video session: {session.internal_session_id}")
         
+        # Map external frame index to internal SAM3 frame index
+        internal_frame_idx = session.frame_idx_mapping.get(request.frame_idx)
+        if internal_frame_idx is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Frame {request.frame_idx} was not uploaded to this session"
+            )
+        
         prompt_request = {
             "type": "add_prompt",
             "session_id": session.internal_session_id,
-            "frame_index": request.frame_idx,
+            "frame_index": internal_frame_idx,
         }
         
         if request.text:
