@@ -1,17 +1,26 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates. All Rights Reserved
-# SAM3 Server - REST API for LiGuard-Web Integration
+# SAM3 Server - Unified REST API for LiGuard-Web Integration
 """
 SAM3 Server: A FastAPI-based REST API for the Segment Anything Model 3.
 
-This server provides a standardized API for image and video segmentation,
+This server provides a unified API for image and video segmentation,
 designed for integration with LiGuard-Web's node-based pipeline system.
 
 Usage:
     conda activate sam3
     python server.py [--host 0.0.0.0] [--port 8765] [--session-timeout 300]
 
-The server manages model sessions with automatic cleanup of idle sessions.
+The server manages sessions with automatic cleanup of idle sessions.
 All image I/O is done via base64-encoded strings for portability.
+
+Unified API:
+    POST /api/connect              - Create a new session
+    GET  /api/{session_id}/is-alive - Check if session is alive
+    POST /api/{session_id}/set-prompt - Set text prompt (queues if no images)
+    POST /api/{session_id}/add-image  - Add image/frame
+    GET  /api/{session_id}/get-output/{frame_idx} - Get raw outputs
+    POST /api/{session_id}/visualize  - Get visualization
+    DELETE /api/{session_id}/disconnect - Close session
 """
 
 from __future__ import annotations
@@ -21,11 +30,12 @@ import base64
 import io
 import logging
 import os
+import random
 import shutil
+import string
 import tempfile
 import threading
 import time
-import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from enum import Enum
@@ -72,6 +82,7 @@ DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8765
 DEFAULT_SESSION_TIMEOUT = 300  # 5 minutes
 DEFAULT_CLEANUP_INTERVAL = 60  # 1 minute
+SESSION_ID_LENGTH = 14
 
 
 # =============================================================================
@@ -83,82 +94,62 @@ class ModelType(str, Enum):
     VIDEO = "video"
 
 
-class SessionCreateRequest(BaseModel):
-    model_type: ModelType = ModelType.IMAGE
+# Unified API Models
+class ConnectRequest(BaseModel):
+    model_type: str = "image"
+    timeout: int = 30
     device: str = "cuda"
 
 
-class SessionResponse(BaseModel):
+class ConnectResponse(BaseModel):
     session_id: str
-    model_type: ModelType
-    created_at: float
-    last_accessed: float
+    error: str = ""
 
 
-class ImageSetRequest(BaseModel):
+class IsAliveResponse(BaseModel):
+    alive: bool
+
+
+class SetPromptRequest(BaseModel):
+    prompt: str
+
+
+class SetPromptResponse(BaseModel):
+    session_id: str
+    queued: bool = False
+
+
+class AddImageRequest(BaseModel):
     image: str  # base64 encoded
+    batch: int = 1
 
 
-class TextPromptRequest(BaseModel):
-    text: str
-    confidence_threshold: float = 0.5
+class AddImageResponse(BaseModel):
+    session_id: str
+    added: bool
+    frame_idx: int = 0
 
 
-class BoxPromptRequest(BaseModel):
-    x1: float  # normalized [0, 1]
-    y1: float
-    x2: float
-    y2: float
-    is_positive: bool = True
-
-
-class PointPromptRequest(BaseModel):
-    x: float  # normalized [0, 1]
-    y: float
-    is_positive: bool = True
+class GetOutputResponse(BaseModel):
+    session_id: str
+    count: int = 0
+    masks: List[str] = []  # base64 encoded PNGs
+    boxes: List[List[float]] = []  # [[x1, y1, x2, y2], ...]
+    scores: List[float] = []
 
 
 class VisualizeRequest(BaseModel):
+    frame_idx: int = 0
     alpha: float = 0.5
 
 
-class SegmentationResult(BaseModel):
-    count: int
-    masks: List[str]  # base64 encoded PNGs
-    boxes: List[List[float]]  # [[x1, y1, x2, y2], ...]
-    scores: List[float]
-
-
 class VisualizeResponse(BaseModel):
-    image: str  # base64 encoded
+    session_id: str
+    image: str = ""  # base64 encoded
 
 
-class VideoStartRequest(BaseModel):
-    streaming: bool = True
-    video_path: Optional[str] = None
-
-
-class VideoFrameRequest(BaseModel):
-    image: str  # base64 encoded
-    frame_idx: int
-
-
-class VideoPromptRequest(BaseModel):
-    frame_idx: int
-    text: Optional[str] = None
-    points: Optional[List[List[float]]] = None  # [[x, y], ...]
-    point_labels: Optional[List[int]] = None  # 1 = positive, 0 = negative
-    boxes: Optional[List[List[float]]] = None  # [[x1, y1, x2, y2], ...]
-    box_labels: Optional[List[int]] = None
-
-
-class VideoPropagateRequest(BaseModel):
-    direction: str = "forward"  # forward, backward, both
-    max_frames: Optional[int] = None
-
-
-class VideoResultRequest(BaseModel):
-    frame_idx: int
+class DisconnectResponse(BaseModel):
+    disconnected: bool
 
 
 class HealthResponse(BaseModel):
@@ -168,55 +159,53 @@ class HealthResponse(BaseModel):
     active_sessions: int
 
 
-class ErrorResponse(BaseModel):
-    error: str
-    detail: Optional[str] = None
-
-
 # =============================================================================
 # Session Management
 # =============================================================================
 
+def generate_session_id(length: int = SESSION_ID_LENGTH) -> str:
+    """Generate a secure alphanumeric session ID."""
+    chars = string.ascii_letters + string.digits
+    return ''.join(random.SystemRandom().choice(chars) for _ in range(length))
+
+
 @dataclass
-class ImageSession:
-    """Holds state for an image segmentation session."""
+class UnifiedSession:
+    """Unified session for both image and video segmentation."""
     session_id: str
-    model: Any = None
-    processor: Optional[Sam3Processor] = None
-    state: Optional[Dict] = None
+    model_type: str  # "image" or "video"
     device: str = "cuda"
+    timeout: int = 30
     created_at: float = field(default_factory=time.time)
     last_accessed: float = field(default_factory=time.time)
     
-    def touch(self) -> None:
-        """Update last accessed time."""
-        self.last_accessed = time.time()
-
-
-@dataclass
-class VideoSession:
-    """Holds state for a video segmentation session."""
-    session_id: str
-    predictor: Any = None
-    internal_session_id: Optional[str] = None
-    frames: List[np.ndarray] = field(default_factory=list)
+    # Model references (shared, not owned)
+    image_model: Any = None
+    image_processor: Optional[Any] = None
+    video_predictor: Any = None
+    
+    # Shared state
+    pending_prompt: Optional[str] = None  # Queued until images arrive
+    frames: List[Optional[np.ndarray]] = field(default_factory=list)
     outputs: Dict[int, Dict] = field(default_factory=dict)
-    streaming: bool = True
+    batch_size: int = 1
+    current_batch: List[np.ndarray] = field(default_factory=list)
+    
+    # Image mode state
+    image_state: Optional[Dict] = None
+    
+    # Video mode state
+    internal_session_id: Optional[str] = None
     temp_dir: Optional[str] = None
-    device: str = "cuda"
-    created_at: float = field(default_factory=time.time)
-    last_accessed: float = field(default_factory=time.time)
-    # Maps external frame indices to internal SAM3 frame indices
     frame_idx_mapping: Dict[int, int] = field(default_factory=dict)
-    # Track how many frames were present when SAM3 session was initialized
     frames_at_init: int = 0
     
     def touch(self) -> None:
         """Update last accessed time."""
         self.last_accessed = time.time()
     
-    def needs_reinit(self) -> bool:
-        """Check if session needs re-initialization due to new frames."""
+    def needs_video_reinit(self) -> bool:
+        """Check if video session needs re-initialization due to new frames."""
         if self.internal_session_id is None:
             return False
         current_frame_count = sum(1 for f in self.frames if f is not None)
@@ -225,14 +214,13 @@ class VideoSession:
 
 class SessionManager:
     """
-    Manages SAM3 model sessions with automatic cleanup of idle sessions.
+    Manages unified SAM3 sessions with automatic cleanup of idle sessions.
     Thread-safe implementation for concurrent access.
     """
     
     def __init__(self, timeout_seconds: int = DEFAULT_SESSION_TIMEOUT):
         self.timeout_seconds = timeout_seconds
-        self._image_sessions: Dict[str, ImageSession] = {}
-        self._video_sessions: Dict[str, VideoSession] = {}
+        self._sessions: Dict[str, UnifiedSession] = {}
         self._lock = threading.RLock()
         self._cleanup_task: Optional[asyncio.Task] = None
         self._running = False
@@ -271,60 +259,64 @@ class SessionManager:
     def _cleanup_expired(self) -> None:
         """Remove sessions that have exceeded the timeout."""
         now = time.time()
-        expired_image = []
-        expired_video = []
+        expired = []
         
         with self._lock:
-            for sid, session in self._image_sessions.items():
+            for sid, session in self._sessions.items():
                 if now - session.last_accessed > self.timeout_seconds:
-                    expired_image.append(sid)
-                    
-            for sid, session in self._video_sessions.items():
-                if now - session.last_accessed > self.timeout_seconds:
-                    expired_video.append(sid)
-                    
-            for sid in expired_image:
-                logger.info(f"Cleaning up expired image session: {sid}")
-                self._image_sessions.pop(sid, None)
-                
-            for sid in expired_video:
-                logger.info(f"Cleaning up expired video session: {sid}")
-                session = self._video_sessions.pop(sid, None)
-                if session and session.predictor and session.internal_session_id:
-                    try:
-                        session.predictor.close_session(session.internal_session_id)
-                    except Exception as e:
-                        logger.warning(f"Error closing video session: {e}")
+                    expired.append(sid)
+            
+            for sid in expired:
+                logger.info(f"Cleaning up expired session: {sid}")
+                self._close_session_internal(sid)
         
-        if expired_image or expired_video:
+        if expired:
             self._maybe_unload_models()
+    
+    def _close_session_internal(self, session_id: str) -> None:
+        """Close a session (must hold lock)."""
+        session = self._sessions.pop(session_id, None)
+        if session:
+            # Clean up video session resources
+            if session.video_predictor and session.internal_session_id:
+                try:
+                    session.video_predictor.close_session(session.internal_session_id)
+                except Exception as e:
+                    logger.warning(f"Error closing video session: {e}")
+            
+            # Clean up temp directory
+            if session.temp_dir:
+                try:
+                    shutil.rmtree(session.temp_dir)
+                    logger.info(f"Cleaned up temp directory: {session.temp_dir}")
+                except Exception as e:
+                    logger.warning(f"Error cleaning up temp directory: {e}")
     
     def _maybe_unload_models(self) -> None:
         """Unload models if no sessions are active."""
         with self._lock:
-            if not self._image_sessions and self._image_model is not None:
-                logger.info("Unloading image model (no active sessions)")
+            if not self._sessions:
                 with self._model_lock:
-                    del self._image_model
-                    self._image_model = None
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                        
-            if not self._video_sessions and self._video_predictor is not None:
-                logger.info("Unloading video predictor (no active sessions)")
-                with self._model_lock:
-                    if hasattr(self._video_predictor, 'shutdown'):
-                        self._video_predictor.shutdown()
-                    del self._video_predictor
-                    self._video_predictor = None
+                    if self._image_model is not None:
+                        logger.info("Unloading image model (no active sessions)")
+                        del self._image_model
+                        self._image_model = None
+                    
+                    if self._video_predictor is not None:
+                        logger.info("Unloading video predictor (no active sessions)")
+                        if hasattr(self._video_predictor, 'shutdown'):
+                            self._video_predictor.shutdown()
+                        del self._video_predictor
+                        self._video_predictor = None
+                    
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
     
-    def _get_image_model(self, device: str = "cuda") -> Tuple[Any, Sam3Processor]:
+    def _get_image_model(self, device: str = "cuda") -> Tuple[Any, Any]:
         """Get or create the shared image model."""
         if not SAM3_AVAILABLE:
             raise RuntimeError("SAM3 is not available in this environment")
-            
+        
         with self._model_lock:
             if self._image_model is None:
                 logger.info(f"Loading SAM3 image model on {device}...")
@@ -336,7 +328,7 @@ class SessionManager:
         """Get or create the shared video predictor."""
         if not SAM3_AVAILABLE:
             raise RuntimeError("SAM3 is not available in this environment")
-            
+        
         with self._model_lock:
             if self._video_predictor is None:
                 logger.info(f"Loading SAM3 video predictor on {device}...")
@@ -344,119 +336,72 @@ class SessionManager:
                 logger.info("SAM3 video predictor loaded")
             return self._video_predictor
     
-    def create_image_session(self, device: str = "cuda") -> ImageSession:
-        """Create a new image segmentation session."""
-        session_id = str(uuid.uuid4())[:12]
-        model, processor = self._get_image_model(device)
+    def create_session(self, model_type: str, device: str = "cuda", timeout: int = 30) -> UnifiedSession:
+        """Create a new unified session."""
+        session_id = generate_session_id()
         
-        session = ImageSession(
+        session = UnifiedSession(
             session_id=session_id,
-            model=model,
-            processor=processor,
+            model_type=model_type,
             device=device,
+            timeout=timeout,
         )
         
-        with self._lock:
-            self._image_sessions[session_id] = session
-            
-        logger.info(f"Created image session: {session_id}")
-        return session
-    
-    def create_video_session(self, device: str = "cuda") -> VideoSession:
-        """Create a new video segmentation session."""
-        session_id = str(uuid.uuid4())[:12]
-        predictor = self._get_video_predictor(device)
-        
-        session = VideoSession(
-            session_id=session_id,
-            predictor=predictor,
-            device=device,
-        )
+        # Load appropriate model
+        if model_type == "image":
+            model, processor = self._get_image_model(device)
+            session.image_model = model
+            session.image_processor = processor
+        else:
+            predictor = self._get_video_predictor(device)
+            session.video_predictor = predictor
         
         with self._lock:
-            self._video_sessions[session_id] = session
-            
-        logger.info(f"Created video session: {session_id}")
+            self._sessions[session_id] = session
+        
+        logger.info(f"Created {model_type} session: {session_id}")
         return session
     
-    def get_image_session(self, session_id: str) -> Optional[ImageSession]:
-        """Get an image session by ID."""
+    def get_session(self, session_id: str) -> Optional[UnifiedSession]:
+        """Get a session by ID and refresh its expiry."""
         with self._lock:
-            session = self._image_sessions.get(session_id)
+            session = self._sessions.get(session_id)
             if session:
                 session.touch()
             return session
     
-    def get_video_session(self, session_id: str) -> Optional[VideoSession]:
-        """Get a video session by ID."""
+    def close_session(self, session_id: str) -> bool:
+        """Close a session and release resources."""
         with self._lock:
-            session = self._video_sessions.get(session_id)
-            if session:
-                session.touch()
-            return session
-    
-    def close_image_session(self, session_id: str) -> bool:
-        """Close an image session."""
-        with self._lock:
-            session = self._image_sessions.pop(session_id, None)
-            if session:
-                logger.info(f"Closed image session: {session_id}")
+            if session_id in self._sessions:
+                self._close_session_internal(session_id)
                 self._maybe_unload_models()
+                logger.info(f"Closed session: {session_id}")
                 return True
             return False
     
-    def close_video_session(self, session_id: str) -> bool:
-        """Close a video session."""
+    def session_exists(self, session_id: str) -> bool:
+        """Check if a session exists."""
         with self._lock:
-            session = self._video_sessions.pop(session_id, None)
-            if session:
-                if session.predictor and session.internal_session_id:
-                    try:
-                        session.predictor.close_session(session.internal_session_id)
-                    except Exception as e:
-                        logger.warning(f"Error closing internal video session: {e}")
-                # Clean up temp directory if it exists
-                if session.temp_dir:
-                    try:
-                        shutil.rmtree(session.temp_dir)
-                        logger.info(f"Cleaned up temp directory: {session.temp_dir}")
-                    except Exception as e:
-                        logger.warning(f"Error cleaning up temp directory: {e}")
-                logger.info(f"Closed video session: {session_id}")
-                self._maybe_unload_models()
-                return True
-            return False
-    
-    def heartbeat(self, session_id: str) -> bool:
-        """Keep a session alive."""
-        with self._lock:
-            if session_id in self._image_sessions:
-                self._image_sessions[session_id].touch()
-                return True
-            if session_id in self._video_sessions:
-                self._video_sessions[session_id].touch()
-                return True
-            return False
+            return session_id in self._sessions
     
     def get_stats(self) -> Dict[str, int]:
         """Get session statistics."""
         with self._lock:
+            image_count = sum(1 for s in self._sessions.values() if s.model_type == "image")
+            video_count = sum(1 for s in self._sessions.values() if s.model_type == "video")
             return {
-                "image_sessions": len(self._image_sessions),
-                "video_sessions": len(self._video_sessions),
-                "total": len(self._image_sessions) + len(self._video_sessions),
+                "image_sessions": image_count,
+                "video_sessions": video_count,
+                "total": len(self._sessions),
             }
     
     def shutdown(self) -> None:
         """Shutdown all sessions and unload models."""
         with self._lock:
-            # Close all image sessions
-            for sid in list(self._image_sessions.keys()):
-                self.close_image_session(sid)
-            
-            # Close all video sessions
-            for sid in list(self._video_sessions.keys()):
-                self.close_video_session(sid)
+            for sid in list(self._sessions.keys()):
+                self._close_session_internal(sid)
+            self._maybe_unload_models()
 
 
 # =============================================================================
@@ -548,8 +493,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="SAM3 Server",
-    description="REST API for Segment Anything Model 3",
-    version="1.0.0",
+    description="Unified REST API for Segment Anything Model 3",
+    version="2.0.0",
     lifespan=lifespan,
 )
 
@@ -591,12 +536,466 @@ async def list_models():
 
 
 # =============================================================================
-# Session Management Endpoints
+# Unified API Endpoints
 # =============================================================================
 
-@app.post("/sessions", response_model=SessionResponse)
-async def create_session(request: SessionCreateRequest):
+def _get_session(session_id: str) -> UnifiedSession:
+    """Helper to get a session or raise 404."""
+    session = session_manager.get_session(session_id)
+    if not session:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Session {session_id} not found"
+        )
+    return session
+
+
+@app.post("/api/connect", response_model=ConnectResponse)
+async def connect(request: ConnectRequest):
     """Create a new segmentation session."""
+    if not SAM3_AVAILABLE:
+        return ConnectResponse(session_id="", error="SAM3 is not available in this environment")
+    
+    try:
+        model_type = request.model_type.lower()
+        if model_type not in ["image", "video"]:
+            return ConnectResponse(session_id="", error=f"Invalid model_type: {model_type}")
+        
+        session = session_manager.create_session(
+            model_type=model_type,
+            device=request.device,
+            timeout=request.timeout,
+        )
+        
+        return ConnectResponse(session_id=session.session_id)
+    except Exception as e:
+        logger.error(f"Error creating session: {e}")
+        return ConnectResponse(session_id="", error=str(e))
+
+
+@app.get("/api/{session_id}/is-alive", response_model=IsAliveResponse)
+async def is_alive(session_id: str):
+    """Check if a session is alive."""
+    # This also refreshes the session expiry
+    exists = session_manager.session_exists(session_id)
+    if exists:
+        session_manager.get_session(session_id)  # Touch to refresh
+    return IsAliveResponse(alive=exists)
+
+
+@app.post("/api/{session_id}/set-prompt", response_model=SetPromptResponse)
+async def set_prompt(session_id: str, request: SetPromptRequest):
+    """Set the text prompt for segmentation."""
+    session = _get_session(session_id)
+    
+    try:
+        prompt = request.prompt.strip()
+        if not prompt:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Prompt cannot be empty"
+            )
+        
+        # Check if we have images to apply prompt to
+        has_images = len(session.frames) > 0 or session.image_state is not None
+        
+        if session.model_type == "image":
+            if session.image_state is None:
+                # Queue the prompt for when image arrives
+                session.pending_prompt = prompt
+                logger.info(f"Session {session_id}: Queued prompt '{prompt}' (no image yet)")
+                return SetPromptResponse(session_id=session_id, queued=True)
+            else:
+                # Apply prompt immediately
+                session.image_state = session.image_processor.set_text_prompt(prompt, session.image_state)
+                logger.info(f"Session {session_id}: Applied text prompt '{prompt}'")
+                return SetPromptResponse(session_id=session_id, queued=False)
+        else:
+            # Video mode - queue prompt, will be applied when frames are processed
+            session.pending_prompt = prompt
+            logger.info(f"Session {session_id}: Queued video prompt '{prompt}'")
+            return SetPromptResponse(session_id=session_id, queued=True)
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error setting prompt: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        )
+
+
+@app.post("/api/{session_id}/add-image", response_model=AddImageResponse)
+async def add_image(session_id: str, request: AddImageRequest):
+    """Add an image for segmentation."""
+    session = _get_session(session_id)
+    
+    try:
+        image = decode_base64_image(request.image)
+        image_np = np.array(image)
+        batch_size = max(1, request.batch)
+        
+        session.batch_size = batch_size
+        frame_idx = len(session.frames)
+        session.frames.append(image_np)
+        session.current_batch.append(image_np)
+        
+        # Check if batch is complete
+        batch_complete = len(session.current_batch) >= batch_size
+        
+        if session.model_type == "image":
+            if batch_complete:
+                # For image mode, set the image(s)
+                if batch_size == 1:
+                    # Single image
+                    session.image_state = session.image_processor.set_image(image)
+                else:
+                    # Batched input - use the last complete batch
+                    # Note: SAM3 image processor may need custom handling for batches
+                    session.image_state = session.image_processor.set_image(image)
+                
+                # Store original for visualization
+                if session.image_state is None:
+                    session.image_state = {}
+                session.image_state["original_image"] = image
+                session.image_state["original_width"] = image.width
+                session.image_state["original_height"] = image.height
+                
+                # Apply pending prompt if any
+                if session.pending_prompt:
+                    session.image_state = session.image_processor.set_text_prompt(
+                        session.pending_prompt, session.image_state
+                    )
+                    logger.info(f"Session {session_id}: Applied pending prompt '{session.pending_prompt}'")
+                    session.pending_prompt = None
+                
+                session.current_batch = []
+                logger.info(f"Session {session_id}: Image set (batch complete, idx={frame_idx})")
+                return AddImageResponse(session_id=session_id, added=True, frame_idx=frame_idx)
+            else:
+                logger.info(f"Session {session_id}: Image added to batch ({len(session.current_batch)}/{batch_size})")
+                return AddImageResponse(session_id=session_id, added=False, frame_idx=frame_idx)
+        
+        else:
+            # Video mode - sliding window approach
+            if batch_complete:
+                # Initialize video session if needed
+                if session.internal_session_id is None or session.needs_video_reinit():
+                    await _initialize_video_session(session)
+                
+                # Apply pending prompt to first frame if any
+                if session.pending_prompt and session.internal_session_id:
+                    internal_frame_idx = session.frame_idx_mapping.get(0, 0)
+                    prompt_request = {
+                        "type": "add_prompt",
+                        "session_id": session.internal_session_id,
+                        "frame_index": internal_frame_idx,
+                        "text": session.pending_prompt,
+                    }
+                    response = session.video_predictor.handle_request(prompt_request)
+                    if "outputs" in response:
+                        session.outputs[0] = response["outputs"]
+                    logger.info(f"Session {session_id}: Applied pending prompt '{session.pending_prompt}'")
+                    session.pending_prompt = None
+                
+                session.current_batch = []
+                logger.info(f"Session {session_id}: Video batch complete (idx={frame_idx})")
+                return AddImageResponse(session_id=session_id, added=True, frame_idx=frame_idx)
+            else:
+                logger.info(f"Session {session_id}: Frame added to batch ({len(session.current_batch)}/{batch_size})")
+                return AddImageResponse(session_id=session_id, added=False, frame_idx=frame_idx)
+    
+    except Exception as e:
+        logger.error(f"Error adding image: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        )
+
+
+async def _initialize_video_session(session: UnifiedSession) -> None:
+    """Initialize the video predictor session."""
+    # Close old session if reinitializing
+    if session.internal_session_id:
+        try:
+            session.video_predictor.close_session(session.internal_session_id)
+        except Exception as e:
+            logger.warning(f"Error closing old session: {e}")
+    
+    # Clean up old temp directory
+    if session.temp_dir:
+        try:
+            shutil.rmtree(session.temp_dir)
+        except Exception as e:
+            logger.warning(f"Error cleaning up temp dir: {e}")
+    
+    # Reset state
+    session.frame_idx_mapping.clear()
+    session.outputs.clear()
+    
+    # Create temp directory and save frames
+    valid_frames = [f for f in session.frames if f is not None]
+    if not valid_frames:
+        return
+    
+    session.temp_dir = tempfile.mkdtemp(prefix="sam3_video_")
+    
+    # Save frames with contiguous indices and create mapping
+    internal_idx = 0
+    for external_idx, frame in enumerate(session.frames):
+        if frame is not None:
+            frame_path = os.path.join(session.temp_dir, f"{internal_idx}.jpg")
+            Image.fromarray(frame).save(frame_path, quality=95)
+            session.frame_idx_mapping[external_idx] = internal_idx
+            internal_idx += 1
+    
+    # Initialize the predictor session
+    response = session.video_predictor.handle_request({
+        "type": "start_session",
+        "resource_path": session.temp_dir,
+    })
+    session.internal_session_id = response.get("session_id")
+    session.frames_at_init = len(valid_frames)
+    logger.info(f"Created internal video session: {session.internal_session_id}")
+
+
+@app.get("/api/{session_id}/get-output/{frame_idx}", response_model=GetOutputResponse)
+async def get_output(session_id: str, frame_idx: int):
+    """Get segmentation outputs for a specific frame."""
+    session = _get_session(session_id)
+    
+    try:
+        if session.model_type == "image":
+            if session.image_state is None:
+                return GetOutputResponse(session_id=session_id, count=0)
+            
+            masks_tensor = session.image_state.get("masks", [])
+            boxes_tensor = session.image_state.get("boxes", [])
+            scores_list = session.image_state.get("scores", [])
+            
+            # Convert masks to base64
+            masks_b64 = []
+            for mask in masks_tensor:
+                mask_np = mask[0].cpu().numpy() if hasattr(mask, 'cpu') else mask
+                masks_b64.append(encode_mask_to_base64(mask_np))
+            
+            # Convert boxes to list
+            boxes_list = []
+            for box in boxes_tensor:
+                box_np = box.cpu().numpy() if hasattr(box, 'cpu') else box
+                boxes_list.append(box_np.tolist())
+            
+            # Convert scores
+            scores = []
+            for score in scores_list:
+                if hasattr(score, 'item'):
+                    scores.append(score.item())
+                else:
+                    scores.append(float(score))
+            
+            return GetOutputResponse(
+                session_id=session_id,
+                count=len(masks_b64),
+                masks=masks_b64,
+                boxes=boxes_list,
+                scores=scores,
+            )
+        
+        else:
+            # Video mode
+            if frame_idx not in session.outputs:
+                # Try to get output if we have a video session
+                if session.internal_session_id and frame_idx in session.frame_idx_mapping:
+                    internal_idx = session.frame_idx_mapping[frame_idx]
+                    # Propagate if needed
+                    try:
+                        response = session.video_predictor.propagate_in_video(
+                            session_id=session.internal_session_id,
+                            propagation_direction=0,  # both
+                            start_frame_idx=0,
+                        )
+                        for frame_data in response:
+                            fidx = frame_data.get("frame_idx", 0)
+                            session.outputs[fidx] = frame_data
+                    except Exception as e:
+                        logger.warning(f"Error propagating: {e}")
+            
+            output = session.outputs.get(frame_idx, {})
+            
+            # Extract masks, boxes, scores from output
+            masks_b64 = []
+            boxes_list = []
+            scores = []
+            
+            if "out_binary_masks" in output:
+                for mask in output["out_binary_masks"]:
+                    masks_b64.append(encode_mask_to_base64(mask))
+            
+            if "out_boxes_xywh" in output:
+                for box in output["out_boxes_xywh"]:
+                    # Convert xywh to xyxy
+                    x, y, w, h = box
+                    boxes_list.append([x, y, x + w, y + h])
+            
+            if "out_probs" in output:
+                scores = [float(p) for p in output["out_probs"]]
+            
+            return GetOutputResponse(
+                session_id=session_id,
+                count=len(masks_b64),
+                masks=masks_b64,
+                boxes=boxes_list,
+                scores=scores,
+            )
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting output: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        )
+
+
+@app.post("/api/{session_id}/visualize", response_model=VisualizeResponse)
+async def visualize(session_id: str, request: VisualizeRequest):
+    """Get visualization of segmentation results."""
+    session = _get_session(session_id)
+    
+    try:
+        import cv2
+        
+        if session.model_type == "image":
+            if session.image_state is None:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="No image set"
+                )
+            
+            # Get original image
+            original = session.image_state.get("original_image")
+            if original is None:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Original image not available"
+                )
+            
+            # Convert to numpy if needed
+            if isinstance(original, Image.Image):
+                img_np = np.array(original)
+            else:
+                img_np = original
+            
+            # Create overlay
+            overlay = img_np.copy().astype(np.float32)
+            
+            masks = session.image_state.get("masks", [])
+            boxes = session.image_state.get("boxes", [])
+            scores = session.image_state.get("scores", [])
+            
+            # Color palette
+            colors = [
+                (255, 0, 0), (0, 255, 0), (0, 0, 255),
+                (255, 255, 0), (255, 0, 255), (0, 255, 255),
+                (128, 0, 0), (0, 128, 0), (0, 0, 128),
+            ]
+            
+            for i, (mask, box, score) in enumerate(zip(masks, boxes, scores)):
+                color = colors[i % len(colors)]
+                mask_np = mask[0].cpu().numpy() if hasattr(mask, 'cpu') else mask
+                
+                # Apply mask overlay
+                for c in range(3):
+                    overlay[:, :, c] = np.where(
+                        mask_np > 0.5,
+                        overlay[:, :, c] * (1 - request.alpha) + color[c] * request.alpha,
+                        overlay[:, :, c]
+                    )
+                
+                # Draw bounding box
+                box_np = box.cpu().numpy() if hasattr(box, 'cpu') else box
+                x1, y1, x2, y2 = [int(v) for v in box_np]
+                cv2.rectangle(overlay, (x1, y1), (x2, y2), color, 2)
+                
+                # Draw score
+                score_val = score.item() if hasattr(score, 'item') else float(score)
+                label = f"{score_val:.2f}"
+                cv2.putText(overlay, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.5, color, 2)
+            
+            # Convert to PIL and encode
+            overlay_uint8 = np.clip(overlay, 0, 255).astype(np.uint8)
+            result_image = Image.fromarray(overlay_uint8)
+            
+            return VisualizeResponse(
+                session_id=session_id,
+                image=encode_image_to_base64(result_image)
+            )
+        
+        else:
+            # Video mode
+            frame_idx = request.frame_idx
+            
+            if frame_idx >= len(session.frames) or session.frames[frame_idx] is None:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Frame {frame_idx} not found"
+                )
+            
+            frame = session.frames[frame_idx]
+            output = session.outputs.get(frame_idx, {})
+            
+            if output and SAM3_AVAILABLE:
+                # Use SAM3's visualization utility
+                overlay = render_masklet_frame(frame, output, frame_idx=frame_idx, alpha=request.alpha)
+            else:
+                overlay = frame
+            
+            result_image = numpy_to_pil(overlay)
+            return VisualizeResponse(
+                session_id=session_id,
+                image=encode_image_to_base64(result_image)
+            )
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error visualizing: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        )
+
+
+@app.delete("/api/{session_id}/disconnect", response_model=DisconnectResponse)
+async def disconnect(session_id: str):
+    """Close a session and release resources."""
+    closed = session_manager.close_session(session_id)
+    return DisconnectResponse(disconnected=closed)
+
+
+# =============================================================================
+# Legacy Endpoints (for backward compatibility)
+# =============================================================================
+
+# Keep the old endpoints working for now
+class LegacySessionCreateRequest(BaseModel):
+    model_type: ModelType = ModelType.IMAGE
+    device: str = "cuda"
+
+
+class LegacySessionResponse(BaseModel):
+    session_id: str
+    model_type: ModelType
+    created_at: float
+    last_accessed: float
+
+
+@app.post("/sessions", response_model=LegacySessionResponse)
+async def create_session_legacy(request: LegacySessionCreateRequest):
+    """Create a new segmentation session (legacy endpoint)."""
     if not SAM3_AVAILABLE:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -604,12 +1003,12 @@ async def create_session(request: SessionCreateRequest):
         )
     
     try:
-        if request.model_type == ModelType.IMAGE:
-            session = session_manager.create_image_session(device=request.device)
-        else:
-            session = session_manager.create_video_session(device=request.device)
+        session = session_manager.create_session(
+            model_type=request.model_type.value,
+            device=request.device,
+        )
         
-        return SessionResponse(
+        return LegacySessionResponse(
             session_id=session.session_id,
             model_type=request.model_type,
             created_at=session.created_at,
@@ -624,12 +1023,9 @@ async def create_session(request: SessionCreateRequest):
 
 
 @app.delete("/sessions/{session_id}")
-async def close_session(session_id: str):
-    """Close a session and release resources."""
-    image_closed = session_manager.close_image_session(session_id)
-    video_closed = session_manager.close_video_session(session_id)
-    
-    if not image_closed and not video_closed:
+async def close_session_legacy(session_id: str):
+    """Close a session and release resources (legacy endpoint)."""
+    if not session_manager.close_session(session_id):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Session {session_id} not found"
@@ -640,8 +1036,9 @@ async def close_session(session_id: str):
 
 @app.post("/sessions/{session_id}/heartbeat")
 async def session_heartbeat(session_id: str):
-    """Keep a session alive."""
-    if not session_manager.heartbeat(session_id):
+    """Keep a session alive (legacy endpoint)."""
+    session = session_manager.get_session(session_id)
+    if not session:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Session {session_id} not found"
@@ -649,36 +1046,39 @@ async def session_heartbeat(session_id: str):
     return {"status": "alive", "session_id": session_id}
 
 
-# =============================================================================
-# Image Segmentation Endpoints
-# =============================================================================
+# Image endpoints (legacy)
+class LegacyImageSetRequest(BaseModel):
+    image: str  # base64 encoded
 
-def _get_image_session(session_id: str) -> ImageSession:
-    """Helper to get an image session or raise 404."""
-    session = session_manager.get_image_session(session_id)
-    if not session:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Image session {session_id} not found"
-        )
-    return session
+
+class LegacyTextPromptRequest(BaseModel):
+    text: str
+    confidence_threshold: float = 0.5
 
 
 @app.post("/image/{session_id}/set")
-async def set_image(session_id: str, request: ImageSetRequest):
-    """Set the image for segmentation."""
-    session = _get_image_session(session_id)
+async def set_image_legacy(session_id: str, request: LegacyImageSetRequest):
+    """Set the image for segmentation (legacy endpoint)."""
+    session = _get_session(session_id)
+    
+    if session.model_type != "image":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This endpoint is for image sessions only"
+        )
     
     try:
         image = decode_base64_image(request.image)
-        session.state = session.processor.set_image(image)
+        session.image_state = session.image_processor.set_image(image)
         
-        # Store original image for visualization (processor may not keep it)
-        if session.state is None:
-            session.state = {}
-        session.state["original_image"] = image
-        session.state["original_width"] = image.width
-        session.state["original_height"] = image.height
+        # Store original image
+        if session.image_state is None:
+            session.image_state = {}
+        session.image_state["original_image"] = image
+        session.image_state["original_width"] = image.width
+        session.image_state["original_height"] = image.height
+        
+        session.frames.append(np.array(image))
         
         return {
             "status": "ok",
@@ -694,23 +1094,29 @@ async def set_image(session_id: str, request: ImageSetRequest):
 
 
 @app.post("/image/{session_id}/prompt/text")
-async def add_text_prompt(session_id: str, request: TextPromptRequest):
-    """Add a text prompt and run inference."""
-    session = _get_image_session(session_id)
+async def add_text_prompt_legacy(session_id: str, request: LegacyTextPromptRequest):
+    """Add a text prompt and run inference (legacy endpoint)."""
+    session = _get_session(session_id)
     
-    if session.state is None:
+    if session.model_type != "image":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This endpoint is for image sessions only"
+        )
+    
+    if session.image_state is None:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="No image set. Call /image/{session_id}/set first."
         )
     
     try:
-        session.state = session.processor.set_confidence_threshold(
-            request.confidence_threshold, session.state
+        session.image_state = session.image_processor.set_confidence_threshold(
+            request.confidence_threshold, session.image_state
         )
-        session.state = session.processor.set_text_prompt(request.text, session.state)
+        session.image_state = session.image_processor.set_text_prompt(request.text, session.image_state)
         
-        masks = session.state.get("masks", [])
+        masks = session.image_state.get("masks", [])
         return {"status": "ok", "objects_found": len(masks)}
     except Exception as e:
         logger.error(f"Error adding text prompt: {e}")
@@ -720,81 +1126,42 @@ async def add_text_prompt(session_id: str, request: TextPromptRequest):
         )
 
 
-@app.post("/image/{session_id}/prompt/box")
-async def add_box_prompt(session_id: str, request: BoxPromptRequest):
-    """Add a box prompt."""
-    session = _get_image_session(session_id)
-    
-    if session.state is None:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="No image set. Call /image/{session_id}/set first."
-        )
-    
-    try:
-        # Convert from xyxy normalized to cxcywh normalized
-        cx = (request.x1 + request.x2) / 2
-        cy = (request.y1 + request.y2) / 2
-        w = request.x2 - request.x1
-        h = request.y2 - request.y1
-        box = [cx, cy, w, h]
-        
-        session.state = session.processor.add_geometric_prompt(
-            box, request.is_positive, session.state
-        )
-        
-        masks = session.state.get("masks", [])
-        return {"status": "ok", "objects_found": len(masks)}
-    except Exception as e:
-        logger.error(f"Error adding box prompt: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=str(e)
-        )
+@app.get("/image/{session_id}/results")
+async def get_results_legacy(session_id: str):
+    """Get segmentation results (legacy endpoint)."""
+    result = await get_output(session_id, 0)
+    return {
+        "count": result.count,
+        "masks": result.masks,
+        "boxes": result.boxes,
+        "scores": result.scores,
+    }
 
 
-@app.post("/image/{session_id}/prompt/point")
-async def add_point_prompt(session_id: str, request: PointPromptRequest):
-    """Add a point prompt."""
-    session = _get_image_session(session_id)
+class LegacyVisualizeRequest(BaseModel):
+    alpha: float = 0.5
+
+
+@app.post("/image/{session_id}/visualize")
+async def visualize_image_legacy(session_id: str, request: LegacyVisualizeRequest = None):
+    """Get the image with segmentation overlay (legacy endpoint)."""
+    if request is None:
+        request = LegacyVisualizeRequest()
     
-    if session.state is None:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="No image set. Call /image/{session_id}/set first."
-        )
-    
-    try:
-        # For point prompts, we create a small box centered on the point
-        # SAM3 image processor currently supports box prompts, not direct points
-        # We simulate a point with a tiny box
-        size = 0.01  # 1% of image dimension
-        box = [request.x, request.y, size, size]
-        
-        session.state = session.processor.add_geometric_prompt(
-            box, request.is_positive, session.state
-        )
-        
-        masks = session.state.get("masks", [])
-        return {"status": "ok", "objects_found": len(masks)}
-    except Exception as e:
-        logger.error(f"Error adding point prompt: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=str(e)
-        )
+    result = await visualize(session_id, VisualizeRequest(frame_idx=0, alpha=request.alpha))
+    return {"image": result.image}
 
 
 @app.post("/image/{session_id}/reset")
-async def reset_prompts(session_id: str):
-    """Clear all prompts."""
-    session = _get_image_session(session_id)
+async def reset_prompts_legacy(session_id: str):
+    """Clear all prompts (legacy endpoint)."""
+    session = _get_session(session_id)
     
-    if session.state is None:
+    if session.image_state is None:
         return {"status": "ok", "message": "No state to reset"}
     
     try:
-        session.state = session.processor.reset_all_prompts(session.state)
+        session.image_state = session.image_processor.reset_all_prompts(session.image_state)
         return {"status": "ok"}
     except Exception as e:
         logger.error(f"Error resetting prompts: {e}")
@@ -804,166 +1171,46 @@ async def reset_prompts(session_id: str):
         )
 
 
-@app.get("/image/{session_id}/results", response_model=SegmentationResult)
-async def get_results(session_id: str):
-    """Get segmentation results."""
-    session = _get_image_session(session_id)
-    
-    if session.state is None:
-        return SegmentationResult(count=0, masks=[], boxes=[], scores=[])
-    
-    try:
-        masks_tensor = session.state.get("masks", [])
-        boxes_tensor = session.state.get("boxes", [])
-        scores_list = session.state.get("scores", [])
-        
-        # Convert masks to base64
-        masks_b64 = []
-        for mask in masks_tensor:
-            mask_np = mask[0].cpu().numpy() if hasattr(mask, 'cpu') else mask
-            masks_b64.append(encode_mask_to_base64(mask_np))
-        
-        # Convert boxes to list
-        boxes_list = []
-        for box in boxes_tensor:
-            box_np = box.cpu().numpy() if hasattr(box, 'cpu') else box
-            boxes_list.append(box_np.tolist())
-        
-        # Convert scores
-        scores = []
-        for score in scores_list:
-            if hasattr(score, 'item'):
-                scores.append(score.item())
-            else:
-                scores.append(float(score))
-        
-        return SegmentationResult(
-            count=len(masks_b64),
-            masks=masks_b64,
-            boxes=boxes_list,
-            scores=scores,
-        )
-    except Exception as e:
-        logger.error(f"Error getting results: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=str(e)
-        )
+# Video endpoints (legacy)
+class LegacyVideoStartRequest(BaseModel):
+    streaming: bool = True
+    video_path: Optional[str] = None
 
 
-@app.post("/image/{session_id}/visualize", response_model=VisualizeResponse)
-async def visualize_image(session_id: str, request: VisualizeRequest = None):
-    """Get the image with segmentation overlay."""
-    if request is None:
-        request = VisualizeRequest()
-    
-    session = _get_image_session(session_id)
-    
-    if session.state is None:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="No image set"
-        )
-    
-    try:
-        import cv2
-        
-        # Get original image
-        original = session.state.get("original_image")
-        if original is None:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Original image not available"
-            )
-        
-        # Convert to numpy if needed
-        if isinstance(original, Image.Image):
-            img_np = np.array(original)
-        else:
-            img_np = original
-        
-        # Create overlay
-        overlay = img_np.copy().astype(np.float32)
-        
-        masks = session.state.get("masks", [])
-        boxes = session.state.get("boxes", [])
-        scores = session.state.get("scores", [])
-        
-        # Color palette
-        colors = [
-            (255, 0, 0), (0, 255, 0), (0, 0, 255),
-            (255, 255, 0), (255, 0, 255), (0, 255, 255),
-            (128, 0, 0), (0, 128, 0), (0, 0, 128),
-        ]
-        
-        for i, (mask, box, score) in enumerate(zip(masks, boxes, scores)):
-            color = colors[i % len(colors)]
-            mask_np = mask[0].cpu().numpy() if hasattr(mask, 'cpu') else mask
-            
-            # Apply mask overlay
-            for c in range(3):
-                overlay[:, :, c] = np.where(
-                    mask_np > 0.5,
-                    overlay[:, :, c] * (1 - request.alpha) + color[c] * request.alpha,
-                    overlay[:, :, c]
-                )
-            
-            # Draw bounding box
-            box_np = box.cpu().numpy() if hasattr(box, 'cpu') else box
-            x1, y1, x2, y2 = [int(v) for v in box_np]
-            cv2.rectangle(overlay, (x1, y1), (x2, y2), color, 2)
-            
-            # Draw score
-            score_val = score.item() if hasattr(score, 'item') else float(score)
-            label = f"{score_val:.2f}"
-            cv2.putText(overlay, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 
-                        0.5, color, 2)
-        
-        # Convert to PIL and encode
-        overlay_uint8 = np.clip(overlay, 0, 255).astype(np.uint8)
-        result_image = Image.fromarray(overlay_uint8)
-        
-        return VisualizeResponse(image=encode_image_to_base64(result_image))
-    except Exception as e:
-        logger.error(f"Error visualizing: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=str(e)
-        )
+class LegacyVideoFrameRequest(BaseModel):
+    image: str  # base64 encoded
+    frame_idx: int
 
 
-# =============================================================================
-# Video Segmentation Endpoints
-# =============================================================================
-
-def _get_video_session(session_id: str) -> VideoSession:
-    """Helper to get a video session or raise 404."""
-    session = session_manager.get_video_session(session_id)
-    if not session:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Video session {session_id} not found"
-        )
-    return session
+class LegacyVideoPromptRequest(BaseModel):
+    frame_idx: int
+    text: Optional[str] = None
+    points: Optional[List[List[float]]] = None
+    point_labels: Optional[List[int]] = None
+    boxes: Optional[List[List[float]]] = None
+    box_labels: Optional[List[int]] = None
 
 
 @app.post("/video/{session_id}/start")
-async def start_video(session_id: str, request: VideoStartRequest):
-    """Start a video session."""
-    session = _get_video_session(session_id)
+async def start_video_legacy(session_id: str, request: LegacyVideoStartRequest):
+    """Start a video session (legacy endpoint)."""
+    session = _get_session(session_id)
+    
+    if session.model_type != "video":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This endpoint is for video sessions only"
+        )
     
     try:
-        session.streaming = request.streaming
-        
         if not request.streaming and request.video_path:
-            # Start with a video file
-            response = session.predictor.handle_request({
+            response = session.video_predictor.handle_request({
                 "type": "start_session",
                 "resource_path": request.video_path,
             })
             session.internal_session_id = response.get("session_id")
         
-        return {"status": "ok", "streaming": session.streaming}
+        return {"status": "ok", "streaming": request.streaming}
     except Exception as e:
         logger.error(f"Error starting video: {e}")
         raise HTTPException(
@@ -973,21 +1220,20 @@ async def start_video(session_id: str, request: VideoStartRequest):
 
 
 @app.post("/video/{session_id}/frame")
-async def add_video_frame(session_id: str, request: VideoFrameRequest):
-    """Add a frame to a streaming video session."""
-    session = _get_video_session(session_id)
+async def add_video_frame_legacy(session_id: str, request: LegacyVideoFrameRequest):
+    """Add a frame to a streaming video session (legacy endpoint)."""
+    session = _get_session(session_id)
     
-    if not session.streaming:
+    if session.model_type != "video":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Session is not in streaming mode"
+            detail="This endpoint is for video sessions only"
         )
     
     try:
         image = decode_base64_image(request.image)
         frame_np = np.array(image)
         
-        # Ensure we have enough slots
         while len(session.frames) <= request.frame_idx:
             session.frames.append(None)
         session.frames[request.frame_idx] = frame_np
@@ -1002,76 +1248,37 @@ async def add_video_frame(session_id: str, request: VideoFrameRequest):
 
 
 @app.post("/video/{session_id}/prompt")
-async def add_video_prompt(session_id: str, request: VideoPromptRequest):
-    """Add a prompt to a video frame."""
-    session = _get_video_session(session_id)
+async def add_video_prompt_legacy(session_id: str, request: LegacyVideoPromptRequest):
+    """Add a prompt to a video frame (legacy endpoint)."""
+    session = _get_session(session_id)
+    
+    if session.model_type != "video":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This endpoint is for video sessions only"
+        )
     
     try:
-        # Check if we need to re-initialize due to new frames being added
-        if session.needs_reinit():
-            logger.info("Re-initializing video session due to new frames")
-            # Close old internal session
-            if session.internal_session_id:
-                try:
-                    session.predictor.close_session(session.internal_session_id)
-                except Exception as e:
-                    logger.warning(f"Error closing old session: {e}")
-            # Clean up old temp directory
-            if session.temp_dir:
-                try:
-                    shutil.rmtree(session.temp_dir)
-                except Exception as e:
-                    logger.warning(f"Error cleaning up temp dir: {e}")
-            # Reset state
-            session.internal_session_id = None
-            session.temp_dir = None
-            session.frame_idx_mapping.clear()
-            session.outputs.clear()
+        # Re-init if needed
+        if session.needs_video_reinit():
+            await _initialize_video_session(session)
         
         # Lazy initialization for streaming mode
         if session.internal_session_id is None:
-            if not session.streaming:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Video session not started. Call /video/{session_id}/start first."
-                )
-            
-            # For streaming mode, check if we have frames to process
             valid_frames = [f for f in session.frames if f is not None]
             if not valid_frames:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="No frames added. Call /video/{session_id}/frame first."
+                    detail="No frames added"
                 )
-            
-            # Create temp directory and save frames
-            logger.info(f"Initializing streaming session with {len(valid_frames)} frames")
-            session.temp_dir = tempfile.mkdtemp(prefix="sam3_video_")
-            
-            # Save frames with contiguous indices and create mapping
-            internal_idx = 0
-            for external_idx, frame in enumerate(session.frames):
-                if frame is not None:
-                    frame_path = os.path.join(session.temp_dir, f"{internal_idx}.jpg")
-                    Image.fromarray(frame).save(frame_path, quality=95)
-                    session.frame_idx_mapping[external_idx] = internal_idx
-                    internal_idx += 1
-            
-            # Initialize the predictor session with the temp directory
-            response = session.predictor.handle_request({
-                "type": "start_session",
-                "resource_path": session.temp_dir,
-            })
-            session.internal_session_id = response.get("session_id")
-            session.frames_at_init = len(valid_frames)
-            logger.info(f"Created internal video session: {session.internal_session_id} with {session.frames_at_init} frames")
+            await _initialize_video_session(session)
         
-        # Map external frame index to internal SAM3 frame index
+        # Map frame index
         internal_frame_idx = session.frame_idx_mapping.get(request.frame_idx)
         if internal_frame_idx is None:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Frame {request.frame_idx} was not uploaded to this session"
+                detail=f"Frame {request.frame_idx} was not uploaded"
             )
         
         prompt_request = {
@@ -1089,9 +1296,8 @@ async def add_video_prompt(session_id: str, request: VideoPromptRequest):
             prompt_request["bounding_boxes"] = request.boxes
             prompt_request["bounding_box_labels"] = request.box_labels or [1] * len(request.boxes)
         
-        response = session.predictor.handle_request(prompt_request)
+        response = session.video_predictor.handle_request(prompt_request)
         
-        # Store outputs
         if "outputs" in response:
             session.outputs[request.frame_idx] = response["outputs"]
         
@@ -1106,10 +1312,21 @@ async def add_video_prompt(session_id: str, request: VideoPromptRequest):
         )
 
 
+class LegacyVideoPropagateRequest(BaseModel):
+    direction: str = "forward"
+    max_frames: Optional[int] = None
+
+
 @app.post("/video/{session_id}/propagate")
-async def propagate_video(session_id: str, request: VideoPropagateRequest):
-    """Propagate prompts through the video."""
-    session = _get_video_session(session_id)
+async def propagate_video_legacy(session_id: str, request: LegacyVideoPropagateRequest):
+    """Propagate prompts through the video (legacy endpoint)."""
+    session = _get_session(session_id)
+    
+    if session.model_type != "video":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This endpoint is for video sessions only"
+        )
     
     try:
         if session.internal_session_id is None:
@@ -1118,22 +1335,16 @@ async def propagate_video(session_id: str, request: VideoPropagateRequest):
                 detail="Video session not started"
             )
         
-        # Map direction to SAM3's expected format
-        direction_map = {
-            "forward": 1,
-            "backward": -1,
-            "both": 0,
-        }
+        direction_map = {"forward": 1, "backward": -1, "both": 0}
         direction = direction_map.get(request.direction, 1)
         
-        response = session.predictor.propagate_in_video(
+        response = session.video_predictor.propagate_in_video(
             session_id=session.internal_session_id,
             propagation_direction=direction,
             start_frame_idx=0,
             max_frame_num_to_track=request.max_frames,
         )
         
-        # Store propagation outputs
         for frame_data in response:
             frame_idx = frame_data.get("frame_idx", 0)
             session.outputs[frame_idx] = frame_data
@@ -1149,84 +1360,26 @@ async def propagate_video(session_id: str, request: VideoPropagateRequest):
         )
 
 
-@app.get("/video/{session_id}/results/{frame_idx}", response_model=SegmentationResult)
-async def get_video_results(session_id: str, frame_idx: int):
-    """Get segmentation results for a specific frame."""
-    session = _get_video_session(session_id)
-    
-    if frame_idx not in session.outputs:
-        return SegmentationResult(count=0, masks=[], boxes=[], scores=[])
-    
-    try:
-        output = session.outputs[frame_idx]
-        
-        # Extract masks, boxes, scores from output
-        masks_b64 = []
-        boxes_list = []
-        scores = []
-        
-        if "out_binary_masks" in output:
-            for mask in output["out_binary_masks"]:
-                masks_b64.append(encode_mask_to_base64(mask))
-        
-        if "out_boxes_xywh" in output:
-            for box in output["out_boxes_xywh"]:
-                # Convert xywh to xyxy
-                x, y, w, h = box
-                boxes_list.append([x, y, x + w, y + h])
-        
-        if "out_probs" in output:
-            scores = [float(p) for p in output["out_probs"]]
-        
-        return SegmentationResult(
-            count=len(masks_b64),
-            masks=masks_b64,
-            boxes=boxes_list,
-            scores=scores,
-        )
-    except Exception as e:
-        logger.error(f"Error getting video results: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=str(e)
-        )
+@app.get("/video/{session_id}/results/{frame_idx}")
+async def get_video_results_legacy(session_id: str, frame_idx: int):
+    """Get segmentation results for a specific frame (legacy endpoint)."""
+    result = await get_output(session_id, frame_idx)
+    return {
+        "count": result.count,
+        "masks": result.masks,
+        "boxes": result.boxes,
+        "scores": result.scores,
+    }
 
 
-@app.post("/video/{session_id}/visualize/{frame_idx}", response_model=VisualizeResponse)
-async def visualize_video_frame(session_id: str, frame_idx: int, request: VisualizeRequest = None):
-    """Get a video frame with segmentation overlay."""
+@app.post("/video/{session_id}/visualize/{frame_idx}")
+async def visualize_video_frame_legacy(session_id: str, frame_idx: int, request: LegacyVisualizeRequest = None):
+    """Get a video frame with segmentation overlay (legacy endpoint)."""
     if request is None:
-        request = VisualizeRequest()
+        request = LegacyVisualizeRequest()
     
-    session = _get_video_session(session_id)
-    
-    try:
-        # Get frame
-        if frame_idx >= len(session.frames) or session.frames[frame_idx] is None:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Frame {frame_idx} not found"
-            )
-        
-        frame = session.frames[frame_idx]
-        output = session.outputs.get(frame_idx, {})
-        
-        if output and SAM3_AVAILABLE:
-            # Use SAM3's visualization utility
-            overlay = render_masklet_frame(frame, output, frame_idx=frame_idx, alpha=request.alpha)
-        else:
-            overlay = frame
-        
-        result_image = numpy_to_pil(overlay)
-        return VisualizeResponse(image=encode_image_to_base64(result_image))
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error visualizing video frame: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=str(e)
-        )
+    result = await visualize(session_id, VisualizeRequest(frame_idx=frame_idx, alpha=request.alpha))
+    return {"image": result.image}
 
 
 # =============================================================================
