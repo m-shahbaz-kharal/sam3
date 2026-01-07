@@ -190,14 +190,17 @@ class UnifiedSession:
     outputs: Dict[int, Dict] = field(default_factory=dict)
     batch_size: int = 1
     current_batch: List[np.ndarray] = field(default_factory=list)
+    lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
     
     # Image mode state
     image_state: Optional[Dict] = None
+    last_frame_idx: Optional[int] = None
     
     # Video mode state
     internal_session_id: Optional[str] = None
     temp_dir: Optional[str] = None
     frame_idx_mapping: Dict[int, int] = field(default_factory=dict)
+    internal_to_external: Dict[int, int] = field(default_factory=dict)
     frames_at_init: int = 0
     
     def touch(self) -> None:
@@ -229,6 +232,8 @@ class SessionManager:
         self._image_model = None
         self._video_predictor = None
         self._model_lock = threading.Lock()
+        self._image_model_device: Optional[str] = None
+        self._video_predictor_device: Optional[str] = None
         
     def start_cleanup_task(self, loop: asyncio.AbstractEventLoop) -> None:
         """Start the background cleanup task."""
@@ -263,7 +268,8 @@ class SessionManager:
         
         with self._lock:
             for sid, session in self._sessions.items():
-                if now - session.last_accessed > self.timeout_seconds:
+                session_timeout = session.timeout if session.timeout > 0 else self.timeout_seconds
+                if now - session.last_accessed > session_timeout:
                     expired.append(sid)
             
             for sid in expired:
@@ -277,20 +283,21 @@ class SessionManager:
         """Close a session (must hold lock)."""
         session = self._sessions.pop(session_id, None)
         if session:
-            # Clean up video session resources
-            if session.video_predictor and session.internal_session_id:
-                try:
-                    session.video_predictor.close_session(session.internal_session_id)
-                except Exception as e:
-                    logger.warning(f"Error closing video session: {e}")
-            
-            # Clean up temp directory
-            if session.temp_dir:
-                try:
-                    shutil.rmtree(session.temp_dir)
-                    logger.info(f"Cleaned up temp directory: {session.temp_dir}")
-                except Exception as e:
-                    logger.warning(f"Error cleaning up temp directory: {e}")
+            with session.lock:
+                # Clean up video session resources
+                if session.video_predictor and session.internal_session_id:
+                    try:
+                        session.video_predictor.close_session(session.internal_session_id)
+                    except Exception as e:
+                        logger.warning(f"Error closing video session: {e}")
+                
+                # Clean up temp directory
+                if session.temp_dir:
+                    try:
+                        shutil.rmtree(session.temp_dir)
+                        logger.info(f"Cleaned up temp directory: {session.temp_dir}")
+                    except Exception as e:
+                        logger.warning(f"Error cleaning up temp directory: {e}")
     
     def _maybe_unload_models(self) -> None:
         """Unload models if no sessions are active."""
@@ -301,6 +308,7 @@ class SessionManager:
                         logger.info("Unloading image model (no active sessions)")
                         del self._image_model
                         self._image_model = None
+                        self._image_model_device = None
                     
                     if self._video_predictor is not None:
                         logger.info("Unloading video predictor (no active sessions)")
@@ -308,6 +316,7 @@ class SessionManager:
                             self._video_predictor.shutdown()
                         del self._video_predictor
                         self._video_predictor = None
+                        self._video_predictor_device = None
                     
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
@@ -321,7 +330,14 @@ class SessionManager:
             if self._image_model is None:
                 logger.info(f"Loading SAM3 image model on {device}...")
                 self._image_model = build_sam3_image_model(device=device)
+                self._image_model_device = device
                 logger.info("SAM3 image model loaded")
+            elif self._image_model_device and self._image_model_device != device:
+                logger.warning(
+                    "Requested image model device '%s' but model is already loaded on '%s'",
+                    device,
+                    self._image_model_device,
+                )
             return self._image_model, Sam3Processor(self._image_model)
     
     def _get_video_predictor(self, device: str = "cuda") -> Any:
@@ -332,19 +348,30 @@ class SessionManager:
         with self._model_lock:
             if self._video_predictor is None:
                 logger.info(f"Loading SAM3 video predictor on {device}...")
-                self._video_predictor = build_sam3_video_predictor()
+                try:
+                    self._video_predictor = build_sam3_video_predictor(device=device)
+                except TypeError:
+                    self._video_predictor = build_sam3_video_predictor()
+                self._video_predictor_device = device
                 logger.info("SAM3 video predictor loaded")
+            elif self._video_predictor_device and self._video_predictor_device != device:
+                logger.warning(
+                    "Requested video predictor device '%s' but predictor is already loaded on '%s'",
+                    device,
+                    self._video_predictor_device,
+                )
             return self._video_predictor
     
     def create_session(self, model_type: str, device: str = "cuda", timeout: int = 30) -> UnifiedSession:
         """Create a new unified session."""
         session_id = generate_session_id()
+        resolved_timeout = timeout if isinstance(timeout, int) and timeout > 0 else self.timeout_seconds
         
         session = UnifiedSession(
             session_id=session_id,
             model_type=model_type,
             device=device,
-            timeout=timeout,
+            timeout=resolved_timeout,
         )
         
         # Load appropriate model
@@ -453,6 +480,15 @@ def numpy_to_pil(arr: np.ndarray) -> Image.Image:
     if arr.dtype != np.uint8:
         arr = (arr * 255).astype(np.uint8)
     return Image.fromarray(arr)
+
+
+def extract_image_outputs(image_state: Dict[str, Any]) -> Dict[str, Any]:
+    """Extract raw outputs from a SAM3 image state."""
+    return {
+        "masks": image_state.get("masks", []),
+        "boxes": image_state.get("boxes", []),
+        "scores": image_state.get("scores", []),
+    }
 
 
 # =============================================================================
@@ -589,32 +625,32 @@ async def set_prompt(session_id: str, request: SetPromptRequest):
     session = _get_session(session_id)
     
     try:
-        prompt = request.prompt.strip()
-        if not prompt:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Prompt cannot be empty"
-            )
-        
-        # Check if we have images to apply prompt to
-        has_images = len(session.frames) > 0 or session.image_state is not None
-        
-        if session.model_type == "image":
-            if session.image_state is None:
-                # Queue the prompt for when image arrives
-                session.pending_prompt = prompt
-                logger.info(f"Session {session_id}: Queued prompt '{prompt}' (no image yet)")
-                return SetPromptResponse(session_id=session_id, queued=True)
+        with session.lock:
+            prompt = request.prompt.strip()
+            if not prompt:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Prompt cannot be empty"
+                )
+            
+            if session.model_type == "image":
+                if session.image_state is None:
+                    # Queue the prompt for when image arrives
+                    session.pending_prompt = prompt
+                    logger.info(f"Session {session_id}: Queued prompt '{prompt}' (no image yet)")
+                    return SetPromptResponse(session_id=session_id, queued=True)
+                else:
+                    # Apply prompt immediately
+                    session.image_state = session.image_processor.set_text_prompt(prompt, session.image_state)
+                    if session.last_frame_idx is not None:
+                        session.outputs[session.last_frame_idx] = extract_image_outputs(session.image_state)
+                    logger.info(f"Session {session_id}: Applied text prompt '{prompt}'")
+                    return SetPromptResponse(session_id=session_id, queued=False)
             else:
-                # Apply prompt immediately
-                session.image_state = session.image_processor.set_text_prompt(prompt, session.image_state)
-                logger.info(f"Session {session_id}: Applied text prompt '{prompt}'")
-                return SetPromptResponse(session_id=session_id, queued=False)
-        else:
-            # Video mode - queue prompt, will be applied when frames are processed
-            session.pending_prompt = prompt
-            logger.info(f"Session {session_id}: Queued video prompt '{prompt}'")
-            return SetPromptResponse(session_id=session_id, queued=True)
+                # Video mode - queue prompt, will be applied when frames are processed
+                session.pending_prompt = prompt
+                logger.info(f"Session {session_id}: Queued video prompt '{prompt}'")
+                return SetPromptResponse(session_id=session_id, queued=True)
     
     except HTTPException:
         raise
@@ -632,79 +668,83 @@ async def add_image(session_id: str, request: AddImageRequest):
     session = _get_session(session_id)
     
     try:
-        image = decode_base64_image(request.image)
-        image_np = np.array(image)
-        batch_size = max(1, request.batch)
-        
-        session.batch_size = batch_size
-        frame_idx = len(session.frames)
-        session.frames.append(image_np)
-        session.current_batch.append(image_np)
-        
-        # Check if batch is complete
-        batch_complete = len(session.current_batch) >= batch_size
-        
-        if session.model_type == "image":
-            if batch_complete:
-                # For image mode, set the image(s)
-                if batch_size == 1:
-                    # Single image
-                    session.image_state = session.image_processor.set_image(image)
+        with session.lock:
+            image = decode_base64_image(request.image)
+            image_np = np.array(image)
+            batch_size = max(1, request.batch)
+            
+            session.batch_size = batch_size
+            frame_idx = len(session.frames)
+            session.frames.append(image_np)
+            session.current_batch.append(image_np)
+            
+            # Check if batch is complete
+            batch_complete = len(session.current_batch) >= batch_size
+            
+            if session.model_type == "image":
+                if batch_complete:
+                    start_idx = frame_idx - len(session.current_batch) + 1
+                    for offset, frame in enumerate(session.current_batch):
+                        idx = start_idx + offset
+                        frame_image = Image.fromarray(frame)
+                        image_state = session.image_processor.set_image(frame_image)
+                        
+                        if image_state is None:
+                            image_state = {}
+                        image_state["original_image"] = frame_image
+                        image_state["original_width"] = frame_image.width
+                        image_state["original_height"] = frame_image.height
+                        
+                        # Apply pending prompt if any
+                        if session.pending_prompt:
+                            image_state = session.image_processor.set_text_prompt(
+                                session.pending_prompt, image_state
+                            )
+                            session.outputs[idx] = extract_image_outputs(image_state)
+                        
+                        if idx == frame_idx:
+                            session.image_state = image_state
+                            session.last_frame_idx = idx
+                    
+                    if session.pending_prompt:
+                        logger.info(f"Session {session_id}: Applied pending prompt '{session.pending_prompt}'")
+                        session.pending_prompt = None
+                    
+                    session.current_batch = []
+                    logger.info(f"Session {session_id}: Image set (batch complete, idx={frame_idx})")
+                    return AddImageResponse(session_id=session_id, added=True, frame_idx=frame_idx)
                 else:
-                    # Batched input - use the last complete batch
-                    # Note: SAM3 image processor may need custom handling for batches
-                    session.image_state = session.image_processor.set_image(image)
-                
-                # Store original for visualization
-                if session.image_state is None:
-                    session.image_state = {}
-                session.image_state["original_image"] = image
-                session.image_state["original_width"] = image.width
-                session.image_state["original_height"] = image.height
-                
-                # Apply pending prompt if any
-                if session.pending_prompt:
-                    session.image_state = session.image_processor.set_text_prompt(
-                        session.pending_prompt, session.image_state
-                    )
-                    logger.info(f"Session {session_id}: Applied pending prompt '{session.pending_prompt}'")
-                    session.pending_prompt = None
-                
-                session.current_batch = []
-                logger.info(f"Session {session_id}: Image set (batch complete, idx={frame_idx})")
-                return AddImageResponse(session_id=session_id, added=True, frame_idx=frame_idx)
+                    logger.info(f"Session {session_id}: Image added to batch ({len(session.current_batch)}/{batch_size})")
+                    return AddImageResponse(session_id=session_id, added=False, frame_idx=frame_idx)
+            
             else:
-                logger.info(f"Session {session_id}: Image added to batch ({len(session.current_batch)}/{batch_size})")
-                return AddImageResponse(session_id=session_id, added=False, frame_idx=frame_idx)
-        
-        else:
-            # Video mode - sliding window approach
-            if batch_complete:
-                # Initialize video session if needed
-                if session.internal_session_id is None or session.needs_video_reinit():
-                    await _initialize_video_session(session)
-                
-                # Apply pending prompt to first frame if any
-                if session.pending_prompt and session.internal_session_id:
-                    internal_frame_idx = session.frame_idx_mapping.get(0, 0)
-                    prompt_request = {
-                        "type": "add_prompt",
-                        "session_id": session.internal_session_id,
-                        "frame_index": internal_frame_idx,
-                        "text": session.pending_prompt,
-                    }
-                    response = session.video_predictor.handle_request(prompt_request)
-                    if "outputs" in response:
-                        session.outputs[0] = response["outputs"]
-                    logger.info(f"Session {session_id}: Applied pending prompt '{session.pending_prompt}'")
-                    session.pending_prompt = None
-                
-                session.current_batch = []
-                logger.info(f"Session {session_id}: Video batch complete (idx={frame_idx})")
-                return AddImageResponse(session_id=session_id, added=True, frame_idx=frame_idx)
-            else:
-                logger.info(f"Session {session_id}: Frame added to batch ({len(session.current_batch)}/{batch_size})")
-                return AddImageResponse(session_id=session_id, added=False, frame_idx=frame_idx)
+                # Video mode - sliding window approach
+                if batch_complete:
+                    # Initialize video session if needed
+                    if session.internal_session_id is None or session.needs_video_reinit():
+                        await _initialize_video_session(session)
+                    
+                    # Apply pending prompt to first frame if any
+                    if session.pending_prompt and session.internal_session_id:
+                        internal_frame_idx = session.frame_idx_mapping.get(0, 0)
+                        prompt_request = {
+                            "type": "add_prompt",
+                            "session_id": session.internal_session_id,
+                            "frame_index": internal_frame_idx,
+                            "text": session.pending_prompt,
+                        }
+                        response = session.video_predictor.handle_request(prompt_request)
+                        if "outputs" in response:
+                            session.outputs[0] = response["outputs"]
+                        logger.info(f"Session {session_id}: Applied pending prompt '{session.pending_prompt}'")
+                        session.pending_prompt = None
+                    
+                    session.current_batch = []
+                    logger.info(f"Session {session_id}: Video batch complete (idx={frame_idx})")
+                    return AddImageResponse(session_id=session_id, added=True, frame_idx=frame_idx)
+                else:
+                    logger.info(f"Session {session_id}: Frame added to batch ({len(session.current_batch)}/{batch_size})")
+                    return AddImageResponse(session_id=session_id, added=False, frame_idx=frame_idx)
     
     except Exception as e:
         logger.error(f"Error adding image: {e}")
@@ -732,6 +772,7 @@ async def _initialize_video_session(session: UnifiedSession) -> None:
     
     # Reset state
     session.frame_idx_mapping.clear()
+    session.internal_to_external.clear()
     session.outputs.clear()
     
     # Create temp directory and save frames
@@ -748,6 +789,7 @@ async def _initialize_video_session(session: UnifiedSession) -> None:
             frame_path = os.path.join(session.temp_dir, f"{internal_idx}.jpg")
             Image.fromarray(frame).save(frame_path, quality=95)
             session.frame_idx_mapping[external_idx] = internal_idx
+            session.internal_to_external[internal_idx] = external_idx
             internal_idx += 1
     
     # Initialize the predictor session
@@ -767,61 +809,69 @@ async def get_output(session_id: str, frame_idx: int):
     
     try:
         if session.model_type == "image":
-            if session.image_state is None:
-                return GetOutputResponse(session_id=session_id, count=0)
-            
-            masks_tensor = session.image_state.get("masks", [])
-            boxes_tensor = session.image_state.get("boxes", [])
-            scores_list = session.image_state.get("scores", [])
-            
-            # Convert masks to base64
-            masks_b64 = []
-            for mask in masks_tensor:
-                mask_np = mask[0].cpu().numpy() if hasattr(mask, 'cpu') else mask
-                masks_b64.append(encode_mask_to_base64(mask_np))
-            
-            # Convert boxes to list
-            boxes_list = []
-            for box in boxes_tensor:
-                box_np = box.cpu().numpy() if hasattr(box, 'cpu') else box
-                boxes_list.append(box_np.tolist())
-            
-            # Convert scores
-            scores = []
-            for score in scores_list:
-                if hasattr(score, 'item'):
-                    scores.append(score.item())
-                else:
-                    scores.append(float(score))
-            
-            return GetOutputResponse(
-                session_id=session_id,
-                count=len(masks_b64),
-                masks=masks_b64,
-                boxes=boxes_list,
-                scores=scores,
-            )
+            with session.lock:
+                output = session.outputs.get(frame_idx)
+                if output is None:
+                    if session.image_state is None:
+                        return GetOutputResponse(session_id=session_id, count=0)
+                    if session.last_frame_idx is not None and session.last_frame_idx != frame_idx:
+                        return GetOutputResponse(session_id=session_id, count=0)
+                    output = session.image_state
+                
+                masks_tensor = output.get("masks", [])
+                boxes_tensor = output.get("boxes", [])
+                scores_list = output.get("scores", [])
+                
+                # Convert masks to base64
+                masks_b64 = []
+                for mask in masks_tensor:
+                    mask_np = mask[0].cpu().numpy() if hasattr(mask, 'cpu') else mask
+                    masks_b64.append(encode_mask_to_base64(mask_np))
+                
+                # Convert boxes to list
+                boxes_list = []
+                for box in boxes_tensor:
+                    box_np = box.cpu().numpy() if hasattr(box, 'cpu') else box
+                    boxes_list.append(box_np.tolist())
+                
+                # Convert scores
+                scores = []
+                for score in scores_list:
+                    if hasattr(score, 'item'):
+                        scores.append(score.item())
+                    else:
+                        scores.append(float(score))
+                
+                return GetOutputResponse(
+                    session_id=session_id,
+                    count=len(masks_b64),
+                    masks=masks_b64,
+                    boxes=boxes_list,
+                    scores=scores,
+                )
         
         else:
             # Video mode
-            if frame_idx not in session.outputs:
-                # Try to get output if we have a video session
-                if session.internal_session_id and frame_idx in session.frame_idx_mapping:
-                    internal_idx = session.frame_idx_mapping[frame_idx]
-                    # Propagate if needed
-                    try:
-                        response = session.video_predictor.propagate_in_video(
-                            session_id=session.internal_session_id,
-                            propagation_direction=0,  # both
-                            start_frame_idx=0,
-                        )
-                        for frame_data in response:
-                            fidx = frame_data.get("frame_idx", 0)
-                            session.outputs[fidx] = frame_data
-                    except Exception as e:
-                        logger.warning(f"Error propagating: {e}")
-            
-            output = session.outputs.get(frame_idx, {})
+            with session.lock:
+                if frame_idx not in session.outputs:
+                    # Try to get output if we have a video session
+                    if session.internal_session_id and frame_idx in session.frame_idx_mapping:
+                        internal_idx = session.frame_idx_mapping[frame_idx]
+                        # Propagate if needed
+                        try:
+                            response = session.video_predictor.propagate_in_video(
+                                session_id=session.internal_session_id,
+                                propagation_direction=0,  # both
+                                start_frame_idx=0,
+                            )
+                            for frame_data in response:
+                                internal_idx = frame_data.get("frame_idx", 0)
+                                external_idx = session.internal_to_external.get(internal_idx, internal_idx)
+                                session.outputs[external_idx] = frame_data
+                        except Exception as e:
+                            logger.warning(f"Error propagating: {e}")
+                
+                output = session.outputs.get(frame_idx, {})
             
             # Extract masks, boxes, scores from output
             masks_b64 = []
@@ -868,32 +918,45 @@ async def visualize(session_id: str, request: VisualizeRequest):
         import cv2
         
         if session.model_type == "image":
-            if session.image_state is None:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="No image set"
-                )
-            
-            # Get original image
-            original = session.image_state.get("original_image")
-            if original is None:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Original image not available"
-                )
-            
-            # Convert to numpy if needed
-            if isinstance(original, Image.Image):
-                img_np = np.array(original)
-            else:
-                img_np = original
-            
-            # Create overlay
-            overlay = img_np.copy().astype(np.float32)
-            
-            masks = session.image_state.get("masks", [])
-            boxes = session.image_state.get("boxes", [])
-            scores = session.image_state.get("scores", [])
+            with session.lock:
+                if not session.frames and session.image_state is None:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="No image set"
+                    )
+                
+                frame_idx = request.frame_idx
+                original = None
+                if 0 <= frame_idx < len(session.frames):
+                    frame = session.frames[frame_idx]
+                    if frame is not None:
+                        original = frame
+                if original is None and session.image_state is not None:
+                    original = session.image_state.get("original_image")
+                
+                if original is None:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Original image not available"
+                    )
+                
+                # Convert to numpy if needed
+                if isinstance(original, Image.Image):
+                    img_np = np.array(original)
+                else:
+                    img_np = original
+                
+                # Create overlay
+                overlay = img_np.copy().astype(np.float32)
+                
+                output = session.outputs.get(frame_idx)
+                if output is None and session.image_state is not None and session.last_frame_idx == frame_idx:
+                    output = session.image_state
+                output = output or {}
+                
+                masks = output.get("masks", [])
+                boxes = output.get("boxes", [])
+                scores = output.get("scores", [])
             
             # Color palette
             colors = [
@@ -936,16 +999,17 @@ async def visualize(session_id: str, request: VisualizeRequest):
         
         else:
             # Video mode
-            frame_idx = request.frame_idx
-            
-            if frame_idx >= len(session.frames) or session.frames[frame_idx] is None:
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail=f"Frame {frame_idx} not found"
-                )
-            
-            frame = session.frames[frame_idx]
-            output = session.outputs.get(frame_idx, {})
+            with session.lock:
+                frame_idx = request.frame_idx
+                
+                if frame_idx >= len(session.frames) or session.frames[frame_idx] is None:
+                    raise HTTPException(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        detail=f"Frame {frame_idx} not found"
+                    )
+                
+                frame = session.frames[frame_idx]
+                output = session.outputs.get(frame_idx, {})
             
             if output and SAM3_AVAILABLE:
                 # Use SAM3's visualization utility
@@ -1068,23 +1132,25 @@ async def set_image_legacy(session_id: str, request: LegacyImageSetRequest):
         )
     
     try:
-        image = decode_base64_image(request.image)
-        session.image_state = session.image_processor.set_image(image)
+        with session.lock:
+            image = decode_base64_image(request.image)
+            session.image_state = session.image_processor.set_image(image)
+            
+            # Store original image
+            if session.image_state is None:
+                session.image_state = {}
+            session.image_state["original_image"] = image
+            session.image_state["original_width"] = image.width
+            session.image_state["original_height"] = image.height
+            
+            session.frames.append(np.array(image))
+            session.last_frame_idx = len(session.frames) - 1
         
-        # Store original image
-        if session.image_state is None:
-            session.image_state = {}
-        session.image_state["original_image"] = image
-        session.image_state["original_width"] = image.width
-        session.image_state["original_height"] = image.height
-        
-        session.frames.append(np.array(image))
-        
-        return {
-            "status": "ok",
-            "width": image.width,
-            "height": image.height,
-        }
+            return {
+                "status": "ok",
+                "width": image.width,
+                "height": image.height,
+            }
     except Exception as e:
         logger.error(f"Error setting image: {e}")
         raise HTTPException(
@@ -1111,13 +1177,16 @@ async def add_text_prompt_legacy(session_id: str, request: LegacyTextPromptReque
         )
     
     try:
-        session.image_state = session.image_processor.set_confidence_threshold(
-            request.confidence_threshold, session.image_state
-        )
-        session.image_state = session.image_processor.set_text_prompt(request.text, session.image_state)
-        
-        masks = session.image_state.get("masks", [])
-        return {"status": "ok", "objects_found": len(masks)}
+        with session.lock:
+            session.image_state = session.image_processor.set_confidence_threshold(
+                request.confidence_threshold, session.image_state
+            )
+            session.image_state = session.image_processor.set_text_prompt(request.text, session.image_state)
+            if session.last_frame_idx is not None:
+                session.outputs[session.last_frame_idx] = extract_image_outputs(session.image_state)
+            
+            masks = session.image_state.get("masks", [])
+            return {"status": "ok", "objects_found": len(masks)}
     except Exception as e:
         logger.error(f"Error adding text prompt: {e}")
         raise HTTPException(
@@ -1161,8 +1230,11 @@ async def reset_prompts_legacy(session_id: str):
         return {"status": "ok", "message": "No state to reset"}
     
     try:
-        session.image_state = session.image_processor.reset_all_prompts(session.image_state)
-        return {"status": "ok"}
+        with session.lock:
+            session.image_state = session.image_processor.reset_all_prompts(session.image_state)
+            if session.last_frame_idx is not None:
+                session.outputs.pop(session.last_frame_idx, None)
+            return {"status": "ok"}
     except Exception as e:
         logger.error(f"Error resetting prompts: {e}")
         raise HTTPException(
@@ -1203,14 +1275,15 @@ async def start_video_legacy(session_id: str, request: LegacyVideoStartRequest):
         )
     
     try:
-        if not request.streaming and request.video_path:
-            response = session.video_predictor.handle_request({
-                "type": "start_session",
-                "resource_path": request.video_path,
-            })
-            session.internal_session_id = response.get("session_id")
-        
-        return {"status": "ok", "streaming": request.streaming}
+        with session.lock:
+            if not request.streaming and request.video_path:
+                response = session.video_predictor.handle_request({
+                    "type": "start_session",
+                    "resource_path": request.video_path,
+                })
+                session.internal_session_id = response.get("session_id")
+            
+            return {"status": "ok", "streaming": request.streaming}
     except Exception as e:
         logger.error(f"Error starting video: {e}")
         raise HTTPException(
@@ -1231,14 +1304,15 @@ async def add_video_frame_legacy(session_id: str, request: LegacyVideoFrameReque
         )
     
     try:
-        image = decode_base64_image(request.image)
-        frame_np = np.array(image)
-        
-        while len(session.frames) <= request.frame_idx:
-            session.frames.append(None)
-        session.frames[request.frame_idx] = frame_np
-        
-        return {"status": "ok", "frame_idx": request.frame_idx}
+        with session.lock:
+            image = decode_base64_image(request.image)
+            frame_np = np.array(image)
+            
+            while len(session.frames) <= request.frame_idx:
+                session.frames.append(None)
+            session.frames[request.frame_idx] = frame_np
+            
+            return {"status": "ok", "frame_idx": request.frame_idx}
     except Exception as e:
         logger.error(f"Error adding frame: {e}")
         raise HTTPException(
@@ -1259,49 +1333,50 @@ async def add_video_prompt_legacy(session_id: str, request: LegacyVideoPromptReq
         )
     
     try:
-        # Re-init if needed
-        if session.needs_video_reinit():
-            await _initialize_video_session(session)
-        
-        # Lazy initialization for streaming mode
-        if session.internal_session_id is None:
-            valid_frames = [f for f in session.frames if f is not None]
-            if not valid_frames:
+        with session.lock:
+            # Re-init if needed
+            if session.needs_video_reinit():
+                await _initialize_video_session(session)
+            
+            # Lazy initialization for streaming mode
+            if session.internal_session_id is None:
+                valid_frames = [f for f in session.frames if f is not None]
+                if not valid_frames:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="No frames added"
+                    )
+                await _initialize_video_session(session)
+            
+            # Map frame index
+            internal_frame_idx = session.frame_idx_mapping.get(request.frame_idx)
+            if internal_frame_idx is None:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="No frames added"
+                    detail=f"Frame {request.frame_idx} was not uploaded"
                 )
-            await _initialize_video_session(session)
-        
-        # Map frame index
-        internal_frame_idx = session.frame_idx_mapping.get(request.frame_idx)
-        if internal_frame_idx is None:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Frame {request.frame_idx} was not uploaded"
-            )
-        
-        prompt_request = {
-            "type": "add_prompt",
-            "session_id": session.internal_session_id,
-            "frame_index": internal_frame_idx,
-        }
-        
-        if request.text:
-            prompt_request["text"] = request.text
-        if request.points:
-            prompt_request["points"] = request.points
-            prompt_request["point_labels"] = request.point_labels or [1] * len(request.points)
-        if request.boxes:
-            prompt_request["bounding_boxes"] = request.boxes
-            prompt_request["bounding_box_labels"] = request.box_labels or [1] * len(request.boxes)
-        
-        response = session.video_predictor.handle_request(prompt_request)
-        
-        if "outputs" in response:
-            session.outputs[request.frame_idx] = response["outputs"]
-        
-        return {"status": "ok", "frame_idx": request.frame_idx}
+            
+            prompt_request = {
+                "type": "add_prompt",
+                "session_id": session.internal_session_id,
+                "frame_index": internal_frame_idx,
+            }
+            
+            if request.text:
+                prompt_request["text"] = request.text
+            if request.points:
+                prompt_request["points"] = request.points
+                prompt_request["point_labels"] = request.point_labels or [1] * len(request.points)
+            if request.boxes:
+                prompt_request["bounding_boxes"] = request.boxes
+                prompt_request["bounding_box_labels"] = request.box_labels or [1] * len(request.boxes)
+            
+            response = session.video_predictor.handle_request(prompt_request)
+            
+            if "outputs" in response:
+                session.outputs[request.frame_idx] = response["outputs"]
+            
+            return {"status": "ok", "frame_idx": request.frame_idx}
     except HTTPException:
         raise
     except Exception as e:
@@ -1329,27 +1404,29 @@ async def propagate_video_legacy(session_id: str, request: LegacyVideoPropagateR
         )
     
     try:
-        if session.internal_session_id is None:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Video session not started"
+        with session.lock:
+            if session.internal_session_id is None:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Video session not started"
+                )
+            
+            direction_map = {"forward": 1, "backward": -1, "both": 0}
+            direction = direction_map.get(request.direction, 1)
+            
+            response = session.video_predictor.propagate_in_video(
+                session_id=session.internal_session_id,
+                propagation_direction=direction,
+                start_frame_idx=0,
+                max_frame_num_to_track=request.max_frames,
             )
-        
-        direction_map = {"forward": 1, "backward": -1, "both": 0}
-        direction = direction_map.get(request.direction, 1)
-        
-        response = session.video_predictor.propagate_in_video(
-            session_id=session.internal_session_id,
-            propagation_direction=direction,
-            start_frame_idx=0,
-            max_frame_num_to_track=request.max_frames,
-        )
-        
-        for frame_data in response:
-            frame_idx = frame_data.get("frame_idx", 0)
-            session.outputs[frame_idx] = frame_data
-        
-        return {"status": "ok", "frames_processed": len(response)}
+            
+            for frame_data in response:
+                internal_idx = frame_data.get("frame_idx", 0)
+                external_idx = session.internal_to_external.get(internal_idx, internal_idx)
+                session.outputs[external_idx] = frame_data
+            
+            return {"status": "ok", "frames_processed": len(response)}
     except HTTPException:
         raise
     except Exception as e:
